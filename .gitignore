@@ -1,0 +1,54 @@
+# Local configuration and secrets (keep shareable templates)
+.env
+.env.*
+!.env.example
+
+# Python environments, caches and build output
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+/build/
+/dist/
+
+# Frontend dependencies, generated assets and coverage
+node_modules/
+frontend/**/dist/
+.vite/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Runtime documents, intermediate results and request traces
+# Keep data/samples/ and docs/examples/ in the repository.
+/data/raw/**
+/data/processing/**
+/data/processed/**
+/data/quarantine/**
+/logs/
+*.log
+
+# Milvus / MinIO / etcd local persistence
+/infra/volumes/
+/volumes/
+
+# Local editor settings and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
