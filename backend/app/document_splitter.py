@@ -54,7 +54,21 @@ class StructuredDocumentSplitter:
             if (doc.metadata.get('content_type') == 'table' or
                     doc.metadata.get('file_type') in ('csv', 'excel')):
                 flush()
-                segments.append(Document(page_content=doc.page_content, metadata=dict(doc.metadata)))
+
+                table_metadata = dict(doc.metadata)
+
+                if table_metadata.get('file_type') == 'docx':
+                    table_metadata.update({
+                        'heading_path': [
+                            headings[key] for key in sorted(headings)
+                        ],
+                        'article': article,
+                    })
+
+                segments.append(Document(
+                    page_content=doc.page_content,
+                    metadata=table_metadata,
+                ))
                 continue
             for original_line in doc.page_content.splitlines():
                 line = original_line.strip()

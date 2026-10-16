@@ -15,8 +15,6 @@ from langchain_community.document_loaders import (
     TextLoader,
     CSVLoader,
     PyPDFium2Loader,
-    Docx2txtLoader,
-    UnstructuredExcelLoader,
     DirectoryLoader
 )
 
@@ -152,42 +150,117 @@ class DocumentLoader:
             raise
     
     def load_docx_file(self, file_path: str) -> List[Document]:
-        """加载Word文档"""
+        """按原文顺序提取 Word 正文和普通表格。"""
         try:
-            loader = Docx2txtLoader(file_path)
-            documents = loader.load()
-            
-            # 添加文件信息到元数据
-            for doc in documents:
-                doc.metadata.update({
-                    'source': file_path,
-                    'file_type': 'docx',
-                    'file_name': Path(file_path).name
-                })
-            
+            import re
+            from docx import Document as WordDocument
+            from docx.text.paragraph import Paragraph
+            from docx.table import Table
+
+            base_metadata = {
+                "source": file_path,
+                "file_type": "docx",
+                "file_name": Path(file_path).name,
+            }
+            documents = []
+
+            for block in WordDocument(file_path).iter_inner_content():
+                if isinstance(block, Paragraph):
+                    text = block.text.strip()
+                    if not text:
+                        continue
+
+                    style_name = block.style.name if block.style else ""
+                    heading = re.fullmatch(r"Heading ([1-6])", style_name)
+                    if heading:
+                        text = "#" * int(heading.group(1)) + " " + text
+
+                    documents.append(Document(
+                        page_content=text + "\n\n",
+                        metadata={**base_metadata, "content_type": "text"},
+                    ))
+
+                elif isinstance(block, Table):
+                    if block._tbl.xpath(".//w:gridSpan | .//w:vMerge"):
+                        raise ValueError("当前步骤暂不支持含合并单元格的 Word 表格")
+                    if any(cell.tables for row in block.rows for cell in row.cells):
+                        raise ValueError("当前步骤暂不支持嵌套 Word 表格")
+
+                    rows = [
+                        [cell.text.strip() for cell in row.cells]
+                        for row in block.rows
+                    ]
+                    if len(rows) < 2 or not any(any(row) for row in rows[1:]):
+                        continue
+                    if len({len(row) for row in rows}) != 1:
+                        raise ValueError("Word 表格各行列数不一致")
+
+                    documents.append(Document(
+                        page_content="\n".join("\t".join(row) for row in rows),
+                        metadata={
+                            **base_metadata,
+                            "content_type": "table",
+                            "table_data": {
+                                "headers": rows[0],
+                                "rows": rows[1:],
+                            },
+                        },
+                    ))
+
+            if not documents:
+                raise ValueError("Word 没有可提取的正文或表格数据")
             return documents
+
         except Exception as e:
-            logger.error(f"加载Word文档失败 {file_path}: {e}")
-            return []
+            logger.error(f"加载 Word 失败 {file_path}: {e}")
+            raise
     
     def load_excel_file(self, file_path: str) -> List[Document]:
-        """加载Excel文件"""
+        """读取各工作表，保留表头和完整数据行。"""
         try:
-            loader = UnstructuredExcelLoader(file_path)
-            documents = loader.load()
-            
-            # 添加文件信息到元数据
-            for doc in documents:
-                doc.metadata.update({
-                    'source': file_path,
-                    'file_type': 'excel',
-                    'file_name': Path(file_path).name
-                })
-            
+            import pandas as pd
+
+            extension = Path(file_path).suffix.lower()
+            engine = "xlrd" if extension == ".xls" else "openpyxl"
+
+            documents = []
+
+            with pd.ExcelFile(file_path, engine=engine) as workbook:
+                for sheet_name in workbook.sheet_names:
+                    frame = pd.read_excel(
+                        workbook,
+                        sheet_name=sheet_name,
+                        dtype=str,
+                        keep_default_na=False,
+                    )
+
+                    # 空工作表或只有表头的工作表不生成片段。
+                    if frame.empty:
+                        continue
+
+                    documents.append(Document(
+                        page_content=frame.to_csv(index=False),
+                        metadata={
+                            "source": file_path,
+                            "file_type": "excel",
+                            "file_name": Path(file_path).name,
+                            "sheet_name": sheet_name,
+                            "content_type": "table",
+                            "table_data": {
+                                "headers": frame.columns.tolist(),
+                                "rows": frame.values.tolist(),
+                            },
+                        },
+                    ))
+
+            if not documents:
+                raise ValueError("Excel 没有可入库的数据记录")
+
             return documents
+
         except Exception as e:
-            logger.error(f"加载Excel文件失败 {file_path}: {e}")
-            return []
+            logger.error(f"加载 Excel 失败 {file_path}: {e}")
+            raise
     
     def load_single_file(self, file_path: str, **kwargs) -> List[Document]:
         """
