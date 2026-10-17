@@ -14,7 +14,6 @@ from langchain_core.documents import Document
 from langchain_community.document_loaders import (
     TextLoader,
     CSVLoader,
-    PyPDFium2Loader,
     DirectoryLoader
 )
 
@@ -127,26 +126,57 @@ class DocumentLoader:
             raise
     
     def load_pdf_file(self, file_path: str) -> List[Document]:
-        """加载PDF文件"""
+        """按原文顺序封装正文与表格，交给统一切分器。"""
         try:
-            loader = PyPDFium2Loader(file_path)
-            documents = loader.load()
-            
-            # 添加文件信息到元数据
-            for i, doc in enumerate(documents):
-                doc.metadata.update({
-                    'source': file_path,
-                    'file_type': 'pdf',
-                    'file_name': Path(file_path).name,
-                    'page_number': i + 1
-                })
-                doc.metadata['extraction_method'] = 'native'
-            if any(not doc.page_content.strip() for doc in documents):
-                raise ValueError('PDF 存在无法提取文字的页面，可能为扫描页；当前阶段尚未接入 OCR，请勿将它当作完整解析结果')
-            
+            from .pdf_parser import extract_pdf_pages
+
+            pages = extract_pdf_pages(file_path)
+            documents = []
+
+            for page in pages:
+
+                base_metadata = {
+                    "source": file_path,
+                    "file_type": "pdf",
+                    "file_name": Path(file_path).name,
+                    "page_number": page["page_number"],
+                    "extraction_method": page["extraction_method"],
+                }
+                buffer = []
+
+                def flush_text():
+                    if buffer:
+                        documents.append(Document(
+                            page_content="\n\n".join(buffer),
+                            metadata={**base_metadata, "content_type": "text"},
+                        ))
+                        buffer.clear()
+
+                for block in page["blocks"]:
+                    if "table_data" in block:
+                        flush_text()
+                        table_metadata = {
+                            **base_metadata,
+                            "content_type": "table",
+                            "table_number": block["table_number"],
+                            "table_bbox": block["bbox"],
+                            "table_data": block["table_data"],
+                        }
+                        for key in ("table_title", "table_note"):
+                            if block.get(key):
+                                table_metadata[key] = block[key]
+                        documents.append(Document(
+                            page_content=block["text"],
+                            metadata=table_metadata,
+                        ))
+                    else:
+                        buffer.append(block["text"])
+                flush_text()
+
             return documents
+
         except Exception as e:
-            logger.error(f"加载PDF文件失败 {file_path}: {e}")
+            logger.error(f"加载 PDF 失败 {file_path}: {e}")
             raise
     
     def load_docx_file(self, file_path: str) -> List[Document]:

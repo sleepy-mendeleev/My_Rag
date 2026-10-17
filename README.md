@@ -4,7 +4,7 @@
 ![Vue](https://img.shields.io/badge/Vue-3-42B883?logo=vuedotjs&logoColor=white)
 ![Milvus](https://img.shields.io/badge/Vector_DB-Milvus-00A1EA)
 
-一个用于学习和演示的 RAG 项目：上传业务文档，将文本与 CSV 表格切分后写入 Milvus，再检索参考资料并生成带来源的回答。提供 Vue 网页界面、向量管理和问答现场记录，方便检查入库与检索过程。
+一个用于学习和演示的 RAG 项目：上传业务文档，将正文与表格统一解析、切分后写入 Milvus，再检索参考资料并生成带来源的回答。提供 Vue 网页界面、向量管理和问答现场记录，方便检查入库与检索过程。
 
 示例制度为虚构测试资料。当前版本以本地开发为主；本文描述仓库中已实现的功能。
 
@@ -14,7 +14,7 @@
 
 | 功能 | 当前行为 |
 | --- | --- |
-| 文档入库 | 上传 PDF、DOCX、TXT、CSV；多文件选择后逐个处理，失败文件保留并可重试 |
+| 文档入库 | 上传 PDF、DOCX、TXT、CSV、XLSX、XLS；多文件选择后逐个处理，失败文件保留并可重试 |
 | 集合管理 | 在“查看入库向量”中选择已有 Milvus 集合，并同步上传与问答使用的集合 |
 | 向量查看 | 分页查看文本、来源、维度，打开正文、元数据和向量详情 |
 | 向量删除 | 单条删除，或勾选当前页的多条记录后删除 |
@@ -26,16 +26,17 @@
 
 ```mermaid
 flowchart LR
-    A[文件上传] --> B[DocumentLoader]
-    B --> C[正文：标题与条款分段]
-    B --> D[CSV：保留表头和完整数据行]
-    C --> E[StructuredDocumentSplitter]
-    D --> F[TableSplitter]
-    E --> G[DashScope Embedding]
-    F --> G
-    G --> H[(Milvus)]
+    A[文件上传] --> B[DocumentLoader：统一 Document 封装]
+    B --> C[StructuredDocumentSplitter]
+    C --> D[正文：标题与条款分段]
+    C --> E[表格：保留表头和完整数据行]
+    D --> F[递归切分]
+    E --> G[TableSplitter：Markdown 分块]
+    F --> H[DashScope Embedding]
+    G --> H
+    H --> M[(Milvus)]
     I[用户问题] --> J[向量检索与 L2 过滤]
-    H --> J
+    M --> J
     J --> K[参考资料与来源]
     K --> L[大模型回答]
 ```
@@ -44,14 +45,42 @@ flowchart LR
 
 ## 文档处理
 
-| 格式 | 解析与切分 | 边界 |
-| --- | --- | --- |
-| TXT / 文字版 PDF | 识别编号章节、条款和 Markdown 标题；长正文用 500 字符、50 字符目标重叠兜底 | PDF 使用 PyPDFium2 原生文字层；不恢复复杂版面 |
-| DOCX | Docx2txt 提取文字后进入统一文本切分 | 未读取 Word 标题样式，未单独还原表格与图片 |
-| CSV | pandas 按字符串读取，按完整行组成 Markdown 表格块，每块重复表头 | 超长单行完整保留并标记 `oversized`；表格不采用普通字符重叠切分 |
-| XLSX / XLS | 已有 UnstructuredExcelLoader 入口 | 依赖尚未纳入核心安装清单，未验证；尚未接入 CSV 的统一表格切分 |
+各格式分别解析，统一封装为 LangChain `Document`，再生成用于检索的 chunk。`page_content` 保存正文或表格的文本表示，`metadata` 保存来源与已识别的结构信息；离线预览 JSON 中的 `content` 对应 `page_content`。
 
-文本片段保留 `document_id`、标题路径、条款、`section_id`、`chunk_id` 等元数据。CSV 表格额外保留 `table_id`、`row_start`、`row_end`；行范围从第一条数据记录开始计数，不包含表头。
+| 格式 | 初始封装方式 | 解析规则 |
+| --- | --- | --- |
+| TXT | 整份文件封装为一个正文 `Document` | 按指定编码读取，进入统一正文切分 |
+| PDF | 逐页处理；连续正文与独立表格按阅读顺序分别封装 | PyMuPDF 提取文字与坐标，按需补充 OCR；pdfplumber 提取普通有框表格 |
+| DOCX | 按原文顺序，分别封装非空段落和普通表格 | python-docx 读取正文与 Heading 1–6 标题样式；标题转成 Markdown 标记，表格保留表头及数据行 |
+| CSV | 整张表封装为一个表格 `Document` | pandas 按字符串读取，保留空值与原始字符串编号，首行为表头 |
+| XLSX / XLS | 每个有数据记录的工作表封装为一个表格 `Document` | pandas 配合 openpyxl / xlrd 读取，保留工作表名；首行为表头，跳过空工作表及仅有表头的工作表 |
+
+初始封装粒度不等于最终 chunk 粒度：Word 相邻段落会继续按章节组织，PDF 正文也可以在同一结构分段内跨页累计；表格会结束当前正文分段，单独进入表格切分。
+
+### 正文与表格切分
+
+- **正文**：识别显式编号章节、条款和 Markdown 标题，先按结构分段，再递归切分。默认正文长度为 500 字符、目标重叠为 50 字符，优先沿段落、换行和标点切分；识别到的标题路径会拼到片段前面，额外占用长度。
+- **表格**：CSV、Excel、Word 和 PDF 中已提取的表格统一交给 `TableSplitter`，生成 Markdown。短表完整保留，长表按完整数据行分块；每块重复表头及已有的表格标题、注释。单元格换行转为 `<br>`，单元格内的竖线转为 `&#124;`。
+- **超长表格行**：单行加上表头和上下文已超过长度预算时，完整保留并标记 `oversized=True`，不截断单元格；表格不采用普通正文的字符重叠切分。
+
+表头与二维数据行暂存在 `metadata["table_data"]` 中供表格切分使用；生成最终 chunk 时移除该临时字段。
+
+### 来源与结构信息
+
+片段保留 `source`、`file_type`、`file_name`、`document_id`、已识别的 `heading_path`、`article`、`section_id`、`chunk_index`、`chunk_id` 等信息。
+
+- `document_id` 根据原文件内容生成；`section_id` 标识一次结构分段，不能直接当作整章的统一编号；`chunk_index` 在各结构分段内从 0 开始。
+- PDF 保留来源页码；跨页正文分段记录 `page_start`、`page_end`，递归生成的子片段继承该范围，尚未细化为每个子片段的精确页码。跨页正文的 `extraction_method` 当前继承首段记录。
+- 表格额外保留 `table_id`、`row_start`、`row_end`、`oversized`，Excel 还保留 `sheet_name`。行范围从第一条数据记录开始按 1 计数，不包含表头。
+
+### PDF 解析与 OCR
+
+- **文字与版面**：优先抽取原生文字，依据文本块坐标恢复典型双栏的阅读顺序；按跨页重复频率和位置保守过滤页眉页脚，保护章节标题、表题、注释等内容。
+- **表格**：提取普通有框表格，将表内文字从正文中分离，并尝试关联同页近邻的显式表格标题和必要注释，再进入统一 Markdown 表格切分。
+- **扫描页**：没有原生文字时执行整页 OCR；混合页保留可读文字层，补充其他区域的图片文字。混合 OCR 在内存副本上遮盖已有可读文字的位置，减少同位置内容被重复识别。
+- **异常处理**：缺少 OCR 语言文件、OCR 未识别到有效文字、表格结构需复核等情况会明确报错；含表格的旋转或裁剪页面因坐标尚未适配，也会拒绝继续解析。
+
+OCR 使用中英文语言文件。运行前需将 `chi_sim.traineddata` 和 `eng.traineddata` 放入项目根目录的 `models/tessdata/`；该目录已被 `.gitignore` 排除，克隆仓库后需自行准备。语言文件可从 [Tesseract tessdata_fast](https://github.com/tesseract-ocr/tessdata_fast) 获取。
 
 ## 快速开始
 
@@ -107,9 +136,9 @@ npm run dev
 
 ### 5. 完成一次演示
 
-1. 集合名称填写 `bank_rag_v2`，上传仓库内的 `docs/examples/bank_structure_demo.txt` 或 `data/samples/bank_table_demo.csv`。
+1. 集合名称填写 `bank_rag_v2`，上传仓库内的 `docs/examples/bank_structure_demo.txt`，或自行准备的本地文档。`data/` 整个目录保留在本地，不随仓库提交。
 2. 点击“立即解析入库”，再打开“查看入库向量”，检查正文和元数据。
-3. 对 CSV 示例提问“办理大额转账需要什么要求？”；对条款示例提问“哪些情况下应暂停办理相关业务并提交人工复核？”
+3. 对条款示例提问“哪些情况下应暂停办理相关业务并提交人工复核？”；使用自备文档时，围绕其中实际内容提问。
 4. 从后端终端日志获取 `request_id`，或使用 API 返回的请求标识，查看 `logs/rag_traces/` 中的对应文件，对照候选、过滤结果和实际参考资料。
 
 新建集合支持动态元数据；旧集合的字段不兼容时，请使用新集合名，系统不会自动删除旧集合。
@@ -119,12 +148,12 @@ npm run dev
 无需 Milvus、API Key 或大模型即可检查样例的加载与切分：
 
 ```powershell
-& .\.venv\Scripts\python.exe -m scripts.preview_document data\samples\bank_table_demo.csv
+& .\.venv\Scripts\python.exe -m scripts.preview_document docs\examples\bank_structure_demo.txt
 ```
 
-结果保存到 `logs/document_preview.json`。也可以将文件路径替换为 `docs/examples/bank_structure_demo.txt`。
+结果保存到 `logs/document_preview.json`。也可以将文件路径替换为自行准备的本地文档；`data/` 中的样例不随仓库提供。
 
-后端自动测试使用模拟数据库和模型，从项目根目录执行：
+后端自动测试使用模拟数据库和模型。部分 PDF、Word 用例依赖本地 `data/samples/` 样例，完整测试前需自行准备这些文件；缺少样例时，相关用例会报错。从项目根目录执行：
 
 ```powershell
 & .\.venv\Scripts\python.exe -m unittest discover -s backend/tests -p "test_*.py" -v
@@ -186,7 +215,7 @@ My_Rag/
 │   └── requirements.txt     # 固定直接依赖版本
 ├── frontend/rag_front/      # Vue 界面、上传队列测试与 npm 锁文件
 ├── configs/.env.example     # 配置模板，复制到根目录 .env
-├── data/samples/            # 可公开的开发样例
+├── data/                    # 本地业务文档与样例，不提交，按需创建
 ├── docs/                    # 当前文档、条款样例与发布整理建议
 ├── scripts/                 # 离线预览入口及历史独立脚本
 ├── infra/                   # Milvus 启动说明
@@ -196,12 +225,14 @@ My_Rag/
 └── .gitignore               # 本地环境、生成文件和运行数据的忽略规则
 ```
 
-`.venv/`、`node_modules/`、`dist/`、实际 `.env`、运行日志、业务文件和数据库数据卷留在本地。依赖清单、`package-lock.json`、配置示例、测试和虚构样例应提交到 GitHub。
+`data/`、`.venv/`、`node_modules/`、`dist/`、实际 `.env`、运行日志、OCR 语言文件和数据库数据卷留在本地。依赖清单、`package-lock.json`、配置示例、源码和测试应提交到 GitHub。
 
 ## 当前边界
 
-- 尚未实现 OCR、图片内容识别、多栏阅读顺序恢复、PDF 表格还原及页眉页脚过滤。PDF 遇到空文字页会拒绝入库，正常空白页也可能触发；混合 PDF 的图片文字可能遗漏。
-- CSV 已完成表格分块；Word、Excel、PDF 表格尚未统一处理。
+- PDF 版面处理主要覆盖典型双栏；复杂多栏、图文交叠和跨页表格拼接仍需核对。页眉页脚过滤采用保守规则，可能保留未确认的噪声。
+- OCR 用于提取图片文字，尚不具备普通插图、流程图的视觉理解；识别错字和异常断行未自动修复，也不保证恢复扫描表格的行列结构。完全空白页目前也会因 OCR 没有有效文字而报错。
+- Word 表格暂限普通矩形表格，合并单元格和嵌套表格会明确报错，图片文字尚未接入 OCR；Excel 按首行表头规则读取，复杂工作表需人工核对，数值单元格仅靠显示格式补出的前导零也不保证恢复。
+- 当前仅有基础空白处理，未删除停用词；统一文本清洗与语义切分尚未接入，正文仍采用结构分段与递归切分。
 - 重复上传会追加记录；稳定的内容 ID 不代表已经实现去重。
 - 当前距离阈值来自实验，尚无独立标注集上的 Top-K 命中率结果；返回的 `confidence` 也不是经过校准的答案可信概率。
 - `scripts/` 中的旧上传、问答脚本使用独立逻辑，不是当前网页链路。`delete_collection.py` 会直接删除硬编码集合，不作为推荐入口。

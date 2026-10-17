@@ -30,13 +30,10 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Runtime documents, intermediate results and request traces
-# Keep data/samples/ and docs/examples/ in the repository.
-/data/raw/**
-/data/processing/**
-/data/processed/**
-/data/quarantine/**
+# Local documents, samples, intermediate results and request traces
+/data/
 /logs/
+/models/tessdata/
 *.log
 
 # Milvus / MinIO / etcd local persistence

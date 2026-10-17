@@ -57,7 +57,7 @@ class StructuredDocumentSplitter:
 
                 table_metadata = dict(doc.metadata)
 
-                if table_metadata.get('file_type') == 'docx':
+                if table_metadata.get('file_type') in ('docx', 'pdf'):
                     table_metadata.update({
                         'heading_path': [
                             headings[key] for key in sorted(headings)
@@ -107,6 +107,11 @@ class StructuredDocumentSplitter:
             table_data = base_metadata.pop('table_data', None)
             is_table = base_metadata.get('content_type') == 'table'
 
+            title_path = base_metadata.get('heading_path', [])
+            if base_metadata.get('article'):
+                title_path = title_path + [base_metadata['article']]
+            prefix = ' / '.join(title_path)
+
             if is_table:
                 if table_data is None:
                     raise ValueError('表格缺少表头和数据行')
@@ -116,17 +121,13 @@ class StructuredDocumentSplitter:
                     table_data['headers'],
                     table_data['rows'],
                     metadata=base_metadata,
+                    reserved_chars=len(f'【标题路径】{prefix}\n') if prefix else 0,
                 )
             else:
                 pieces = [
                     Document(page_content=body, metadata=dict(base_metadata))
                     for body in self.splitter.split_text(segment.page_content)
                 ]
-
-            title_path = base_metadata.get('heading_path', [])
-            if base_metadata.get('article'):
-                title_path = title_path + [base_metadata['article']]
-            prefix = ' / '.join(title_path)
 
             for chunk_index, piece in enumerate(pieces):
                 body = piece.page_content

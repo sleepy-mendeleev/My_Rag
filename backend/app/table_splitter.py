@@ -21,10 +21,12 @@ class TableSplitter:
 
         return "| " + " | ".join(cells) + " |"
 
-    def split(self, headers, rows, metadata=None):
-        """按完整行分块；每块重复表头。"""
+    def split(self, headers, rows, metadata=None, reserved_chars=0):
+        """按完整行分块；重复表头与说明，并为外层标题预留长度。"""
         if not headers:
             raise ValueError("表格缺少表头")
+        if reserved_chars < 0:
+            raise ValueError("reserved_chars 不能小于 0")
 
         rows = list(rows)
         for number, row in enumerate(rows, 1):
@@ -34,22 +36,28 @@ class TableSplitter:
         # 每个片段都带上表头和 Markdown 分隔行。
         prefix = self._format_row(headers) + "\n"
         prefix += self._format_row(["---"] * len(headers))
+        title = str((metadata or {}).get("table_title") or "")
+        note = str((metadata or {}).get("table_note") or "")
+        if title:
+            prefix = title + "\n\n" + prefix
+        suffix = "\n\n" + note if note else ""
+        fixed_size = len(prefix) + len(suffix) + reserved_chars
 
         chunks = []
         current_rows = []
-        current_size = len(prefix)
+        current_size = fixed_size
         row_start = 1
 
         def emit(row_end):
             """把当前积累的数据行生成一个 Document。"""
-            content = prefix + "\n" + "\n".join(current_rows)
+            content = prefix + "\n" + "\n".join(current_rows) + suffix
             chunk_metadata = dict(metadata or {})
 
             chunk_metadata.update({
                 "content_type": "table",
                 "row_start": row_start,
                 "row_end": row_end,
-                "oversized": len(content) > self.max_chars,
+                "oversized": len(content) + reserved_chars > self.max_chars,
             })
 
             chunks.append(Document(
@@ -65,7 +73,7 @@ class TableSplitter:
             if current_rows and current_size + added_size > self.max_chars:
                 emit(row_number - 1)
                 current_rows = []
-                current_size = len(prefix)
+                current_size = fixed_size
                 row_start = row_number
 
             current_rows.append(row_text)
