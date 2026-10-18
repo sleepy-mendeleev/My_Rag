@@ -16,6 +16,7 @@ from langchain_community.document_loaders import (
     CSVLoader,
     DirectoryLoader
 )
+from .text_cleaner import clean_documents
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -321,6 +322,7 @@ class DocumentLoader:
             documents = self.load_excel_file(file_path)
         else:
             raise ValueError(f'暂不支持文件类型：{Path(file_path).suffix}；旧版 .doc 请先转为 .docx')
+        documents = clean_documents(documents)
         if not documents or not any(doc.page_content.strip() for doc in documents):
             raise ValueError('未提取到有效文字，请检查文件格式、编码或扫描件 OCR 需求')
         # Content identity is stable when a file is uploaded to another temporary path.
