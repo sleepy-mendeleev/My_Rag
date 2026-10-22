@@ -74,7 +74,7 @@ class VectorDatabaseManager:
         
         # 文件解析和结构切分各自只有一个入口。
         self.document_loader = DocumentLoader()
-        self.text_splitter = StructuredDocumentSplitter(chunk_size, chunk_overlap)
+        self._init_text_splitter()
 
         # 连接到Milvus
         self._connect_to_milvus()
@@ -83,6 +83,52 @@ class VectorDatabaseManager:
         self.vectorstore = None
         # 延迟加载：不要在 __init__ 中调用 _load_existing_db，避免启动时连接未就绪或报错
         # self._load_existing_db() 
+
+
+    def _init_text_splitter(self):
+        """读取切分配置，复用已经初始化的 Embedding 模型。"""
+        flag = os.getenv(
+            "SEMANTIC_SPLIT_ENABLED", "false"
+        ).strip().lower()
+
+        if flag not in ("true", "false"):
+            raise ValueError(
+                "SEMANTIC_SPLIT_ENABLED 必须为 true 或 false"
+            )
+
+        enabled = flag == "true"
+        threshold = None
+
+        if enabled:
+            raw_threshold = os.getenv(
+                "SEMANTIC_SIMILARITY_THRESHOLD", ""
+            ).strip()
+
+            if not raw_threshold:
+                raise ValueError(
+                    "启用语义切分时，请设置 "
+                    "SEMANTIC_SIMILARITY_THRESHOLD"
+                )
+
+            try:
+                threshold = float(raw_threshold)
+            except ValueError as error:
+                raise ValueError(
+                    "SEMANTIC_SIMILARITY_THRESHOLD 必须为数字"
+                ) from error
+
+        self.text_splitter = StructuredDocumentSplitter(
+            self.chunk_size,
+            self.chunk_overlap,
+            embeddings=self.embeddings if enabled else None,
+            semantic_threshold=threshold,
+        )
+
+        logger.info(
+            "正文语义切分：%s，阈值：%s",
+            "启用" if enabled else "关闭",
+            threshold,
+        )
 
     def _init_embeddings(self):
         """初始化嵌入模型"""
@@ -201,11 +247,20 @@ class VectorDatabaseManager:
             documents = self.load_document(file_path)
             if file_name:
                 for document in documents:
-                    document.metadata['file_name'] = file_name
+                    document.metadata.update({
+                        "file_name": file_name,
+                        "source": file_name,
+                    })
             if not documents:
                 return False
             
             split_docs = self.split_documents(documents)
+
+            if not split_docs:
+                raise ValueError(
+                    "文件未生成有效片段，请检查是否为空白或仅包含标题"
+                )
+
             self.add_documents_to_db(split_docs, collection_name)
             
             logger.info(f"文件处理完成: {file_path}")

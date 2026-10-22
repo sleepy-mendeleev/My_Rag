@@ -1,18 +1,98 @@
-"""Rule-based chapter/article splitting for extracted text, without OCR or LLM calls."""
+"""结构分段、语义分组与长度兜底。"""
 import hashlib
+import logging
 import re
-from .table_splitter import TableSplitter
+from math import isfinite
+
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from .semantic_splitter import semantic_split_text, split_semantic_units
+from .table_splitter import TableSplitter
+from .chunk_postprocessor import postprocess_chunks
+
+logger = logging.getLogger(__name__)
+
 
 class StructuredDocumentSplitter:
-    def __init__(self, chunk_size=500, chunk_overlap=50):
-        self.table_splitter = TableSplitter(max_chars=chunk_size)
-        self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size, chunk_overlap=chunk_overlap,
-            separators=['\n\n', '\n', '。', '！', '？', '；', '，', ' ', ''])
+    def __init__(
+        self,
+        chunk_size=500,
+        chunk_overlap=50,
+        embeddings=None,
+        semantic_threshold=None,
+    ):
+        if chunk_size <= 0:
+            raise ValueError("chunk_size 必须大于 0")
 
+        if not 0 <= chunk_overlap < chunk_size:
+            raise ValueError("chunk_overlap 必须非负且小于 chunk_size")
+
+        if embeddings is not None and (
+            semantic_threshold is None
+            or not isfinite(semantic_threshold)
+            or not -1 <= semantic_threshold <= 1
+        ):
+            raise ValueError("启用语义切分时，必须提供有效的相似度阈值")
+
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.embeddings = embeddings
+        self.semantic_threshold = semantic_threshold
+        self.table_splitter = TableSplitter(max_chars=chunk_size)
+
+    def _split_body(self, text, reserved_chars=0, preserve_short=False):
+        """返回正文片段及实际使用的切分策略版本。"""
+        budget = self.chunk_size - reserved_chars
+        if budget <= 0:
+            raise ValueError("标题前缀已占满 chunk_size，无法容纳正文")
+
+        if not text.strip():
+            return [], "structure-v2"
+
+        groups = [text]
+        version = "structure-v2"
+
+        use_semantic = (
+            self.embeddings is not None
+            and not (preserve_short and len(text) <= budget)
+            and len(split_semantic_units(text)) > 1
+        )
+
+        if use_semantic:
+            try:
+                groups = semantic_split_text(
+                    text,
+                    self.embeddings,
+                    self.semantic_threshold,
+                )
+            except Exception as error:
+                logger.warning(
+                    "语义切分失败，回退递归切分：%s", error
+                )
+            else:
+                version = "semantic-v1"
+
+        length_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=budget,
+            chunk_overlap=min(self.chunk_overlap, budget - 1),
+            separators=[
+                "\n\n", "\n", "。", "！", "？", "；", "，", " ", ""
+            ],
+        )
+
+        bodies = []
+        for group in groups:
+            if not group.strip():
+                continue
+
+            if len(group) <= budget:
+                bodies.append(group)
+            else:
+                bodies.extend(length_splitter.split_text(group))
+
+        return bodies, version
+    
     @staticmethod
     def heading(line):
         """Conservative explicit headings; font/layout based detection comes later."""
@@ -25,7 +105,8 @@ class StructuredDocumentSplitter:
             return (1 if match[1] == '章' else 2), line
         return None
 
-    def split_documents(self, documents):
+    def _build_segments(self, documents):
+        """按标题、条款和表格边界组织结构段。"""
         segments = []
         buffer = []
         headings = {}
@@ -95,14 +176,21 @@ class StructuredDocumentSplitter:
                     metadata['page_end'] = doc.metadata['page_number']
                 buffer.append(original_line)
         flush()
+        return segments
+
+    def split_documents(self, documents):
+        """先组织结构段，再分别切分正文与表格。"""
+        segments = self._build_segments(documents)
 
         result = []
         for segment_number, segment in enumerate(segments):
             base_metadata = dict(segment.metadata)
             document_id = base_metadata.get('document_id') or hashlib.sha256(
-                str(base_metadata.get('source', '')).encode()).hexdigest()
+                str(base_metadata.get('source', '')).encode()
+            ).hexdigest()
             section_id = hashlib.sha256(
-                f'{document_id}:{segment_number}'.encode()).hexdigest()
+                f'{document_id}:{segment_number}'.encode()
+            ).hexdigest()
 
             table_data = base_metadata.pop('table_data', None)
             is_table = base_metadata.get('content_type') == 'table'
@@ -110,23 +198,33 @@ class StructuredDocumentSplitter:
             title_path = base_metadata.get('heading_path', [])
             if base_metadata.get('article'):
                 title_path = title_path + [base_metadata['article']]
+
             prefix = ' / '.join(title_path)
+            prefix_text = f'【标题路径】{prefix}\n' if prefix else ''
 
             if is_table:
                 if table_data is None:
                     raise ValueError('表格缺少表头和数据行')
 
+                splitter_version = "table-v1"
                 base_metadata['table_id'] = section_id
+
                 pieces = self.table_splitter.split(
                     table_data['headers'],
                     table_data['rows'],
                     metadata=base_metadata,
-                    reserved_chars=len(f'【标题路径】{prefix}\n') if prefix else 0,
+                    reserved_chars=len(prefix_text),
                 )
             else:
+                bodies, splitter_version = self._split_body(
+                    segment.page_content,
+                    reserved_chars=len(prefix_text),
+                    preserve_short=bool(base_metadata.get('article')),
+                )
+
                 pieces = [
                     Document(page_content=body, metadata=dict(base_metadata))
-                    for body in self.splitter.split_text(segment.page_content)
+                    for body in bodies
                 ]
 
             for chunk_index, piece in enumerate(pieces):
@@ -137,11 +235,22 @@ class StructuredDocumentSplitter:
                     'section_id': section_id,
                     'chunk_index': chunk_index,
                     'chunk_id': hashlib.sha256(
-                        f'{section_id}:{chunk_index}:{body}'.encode()).hexdigest(),
-                    'splitter_version': 'table-v1' if is_table else 'structure-v1',
+                        f'{section_id}:{chunk_index}:{body}'.encode()
+                    ).hexdigest(),
+                    'splitter_version': splitter_version,
                 })
 
-                content = f'【标题路径】{prefix}\n{body}' if prefix else body
-                result.append(Document(page_content=content, metadata=metadata))
+                content = prefix_text + body
 
-        return result
+                if not is_table and len(content) > self.chunk_size:
+                    raise ValueError("正文片段包含标题后超过长度上限")
+
+                result.append(Document(
+                    page_content=content,
+                    metadata=metadata,
+                ))
+
+        return postprocess_chunks(
+            result,
+            max_chars=self.chunk_size,
+        )
